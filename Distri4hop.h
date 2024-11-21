@@ -440,7 +440,7 @@ public:
 				long long local_cnt = 0;
 				unsigned char *used = new unsigned char[totalV/8+1];
 				memset( used, 0, sizeof(unsigned char) * (totalV/8+1) );
-				vector<int> cand, flg;
+				vector<int> cand;
 				
 				char *nowdis = new char[totalV];
 				memset( nowdis, -1, sizeof(char) * totalV);
@@ -448,8 +448,7 @@ public:
 				for( int u = pid; u < totalV; u += np ){
 
 					cand.clear();
-					flg.resize(totalV, 0);
-					
+					unordered_map<int, int> flg;					
 					for( int i = 0; i < con[u].size(); ++i ){
 						int w = con[u][i];
 
