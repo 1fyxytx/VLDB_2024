@@ -440,7 +440,7 @@ public:
 				long long local_cnt = 0;
 				unsigned char *used = new unsigned char[totalV/8+1];
 				memset( used, 0, sizeof(unsigned char) * (totalV/8+1) );
-				vector<int> cand;
+				vector<int> cand, candFg, flags(BoundNum);
 				
 				char *nowdis = new char[totalV];
 				memset( nowdis, -1, sizeof(char) * totalV);
@@ -448,7 +448,7 @@ public:
 				for( int u = pid; u < totalV; u += np ){
 
 					cand.clear();
-					unordered_map<int, int> flg;					
+					candFg.clear();					
 					for( int i = 0; i < con[u].size(); ++i ){
 						int w = con[u][i];
 
@@ -458,9 +458,10 @@ public:
 
 							int ff = flags[w][j];
 
-							if (w < BoundNum) ff = 1; // 由另外的边界点传输而来
-							
-							if (ff == 1) flg[v] = ff; // 由于领居顺序不一致，所以一旦有1标记，就不用改了
+							if (ff == 1 and flags[v] == 0){
+								flags[v] = 1;
+								candFg.push_back(v);
+							}
 
 							if( !(used[v/8]&(1<<(v%8))) ) {
 								used[v/8] |= (1<<(v%8)), cand.push_back(v);
@@ -486,10 +487,12 @@ public:
 					sort(cand.begin(), cand.end());
 					for( int i = 0; i < (int) cand.size(); ++i ) {
 						label_new[u].push_back((((unsigned)cand[i])<<MAXMOV) | (unsigned) dis), ++local_cnt;
-						flg_new[u].push_back(flg[cand[i]]);
+						flg_new[u].push_back(flags[cand[i]]);
 					}
 					for( int i = 0; i < (int) label[u].size(); ++i ) 
 						nowdis[label[u][i]>>MAXMOV] = -1;
+
+					for (int vid: candFg) flags[vid] = 0;
 				}
 				#pragma omp critical
 				{
