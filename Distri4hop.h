@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <ext/hash_map>
 #include <string.h>
-#include <cmath>
+#include <map>
 #include <numeric>
 #include <utility>
 #include <time.h>
@@ -61,8 +61,7 @@ struct EnumValue {
 
 
 struct MsgInf {
-	int tgt;
-	unsigned inf; // vid + dis
+	vector<treeinf> Neig;
 
 	MsgInf(){}
 
@@ -114,246 +113,202 @@ public:
 class LCRBlockWorker : public BWorker<LCRBlock>{
 public:
 	unsigned MAXDIS, MAXMOV, MASK;
-	unsigned MAXDIS1, MAXMOV1, MASK1;
-
-	vector<unsigned> *label, *flags, *root; // record the distance to landmarks
+	vector<unsigned> *label, *flags;
 	vector<vector<unsigned> > con, conB;
 	bool *usd_bp;
+	bool* is_indep;
 	BPLabel *label_bp;
-    int BoundNum = 0, topk = 5;
-	vector<pair<unsigned, unsigned> > CandV;
-	int tstid = 0;
-	long long LocaEdges = 0;
-	vector<int> ActiveV;
-	unsigned actV = 0;
+    int BoundNum = 0;
 
 	virtual LCRVertex *toVertex(char *line){
 		LCRVertex *v;
 		return v;
 	}
 
-	vector<int> Convert(unsigned temp)
-	{
-		vector<int> result;
-		int i = 0;
-		while (temp != 0)
-		{
-			if ((temp & 1) == 1)
-			{
-				result.push_back(i);
-			}
-			i++;
-			temp = temp >> 1;
-		}
-		return result;
-	}
 
+	void construct_bp_label(){
+        label_bp = new BPLabel[totalV];
+        usd_bp = new bool[totalV];
+        memset( usd_bp, 0, sizeof(bool) * totalV );
+        vector<int> v_vs[N_ROOTS];
 
-	void merge(vector<pair<unsigned, unsigned>>& elem){
-		sort(elem.begin(), elem.end());
-		unsigned tgt = elem[0].first;
-		int p = 0;
+        // ===============================  //
+        int r = 0;
+        for (int i_bpspt = 0; i_bpspt < N_ROOTS; ++i_bpspt) {
+            while (r < totalV && usd_bp[r]) ++r;
+            if (r == totalV) {
+                for (int v = 0; v < totalV; ++v) 
+                    label_bp[v].bpspt_d[i_bpspt] = MAXD;
+                continue;
+            }
+            usd_bp[r] = true;
+            v_vs[i_bpspt].push_back(r);
+            int ns = 0;
+            for (int i = 0; i < con[r].size(); ++i) {
+                int v = con[r][i];
+                if (!usd_bp[v]) {
+                    usd_bp[v] = true;
+                    v_vs[i_bpspt].push_back(v);
+                    if (++ns == 64) break;
+                }
+            }
+        }
 
-		for (int i=1; i<elem.size(); ++i){
-			unsigned vid = elem[i].first;
-			if (tgt == vid){
-				elem[p].second |= elem[i].second;
-			}else{
-				p += 1;
-				elem[p] = elem[i]; 
-				tgt = vid;
-			}
-		}
+        // ===============================  //
+        int n_threads = 1;
+        #pragma omp parallel
+        {
+            if(omp_get_thread_num() == 0) n_threads = omp_get_num_threads();
+        }
+        if( n_threads > MAX_BP_THREADS ) omp_set_num_threads(MAX_BP_THREADS);
 
-		vector<pair<unsigned, unsigned> >(elem).swap(elem);
-	}
+        #pragma omp parallel
+        {
+            int pid = omp_get_thread_num(), np = omp_get_num_threads();
+            // if( pid == 0 ) 
+            //     printf( "n_threads_bp = %d\n", np );
+            vector<uint8_t> tmp_d(totalV);
+            vector<pair<uint64_t, uint64_t> > tmp_s(totalV);
+            vector<int> que(totalV);
+            vector<pair<int, int> > child_es(totalEdges*2);
 
+            for (int i_bpspt = pid; i_bpspt < N_ROOTS; i_bpspt+=np) {
+                // printf( "[%d]", i_bpspt );
 
-	void construct_bp_label(){ // == vFlag 和 candidat ==
-		int dis = 0;
-		vector<vector<pair<unsigned, unsigned> > > Messages(_num_workers);
-		vector<pair<unsigned, unsigned> > LocalInf;
+                if( v_vs[i_bpspt].size() == 0 ) continue;
+                fill(tmp_d.begin(), tmp_d.end(), MAXD);
+                fill(tmp_s.begin(), tmp_s.end(), make_pair(0, 0));
 
-		while (true){
-			
-			for (int i=0; i<CandV.size(); ++i){
-				
-				unsigned v1 = CandV[i].first, landV = CandV[i].second; // v2 是 topk个点的label的集合
-				vector<int> TgtV = Convert(landV);
+                r = v_vs[i_bpspt][0];
+                int que_t0 = 0, que_t1 = 0, que_h = 0;
+                que[que_h++] = r;
+                tmp_d[r] = 0;
+                que_t1 = que_h;
 
-				int nowID = v2p[v1];
-				
-				vector<unsigned>& rlab = root[nowID];
+                for( size_t i = 1; i < v_vs[i_bpspt].size(); ++i) {
+                    int v = v_vs[i_bpspt][i];
+                    que[que_h++] = v;
+                    tmp_d[v] = 1;
+                    tmp_s[v].first = 1ULL << (i-1);
+                }
 
-				unsigned temp = 0;
-				for (int j=0; j<TgtV.size(); ++j){
-					int pla = TgtV[j];
-					if (rlab[pla] == 100000){
-						rlab[pla] = dis;
-						unsigned val = pow(2,pla);
-						temp |= val;						
-					}
-				}
-				
-				// == transfer to neighbors ==
-				if (temp == 0) continue; // 不需要传标签
+                for (int d = 0; que_t0 < que_h; ++d) {
+                    int num_child_es = 0;
 
-				for (int ii=0; ii<con[nowID].size(); ++ii){ // 同分区的顶点
-					int vid = p2v[con[nowID][ii]]; // 
-					LocalInf.push_back(make_pair(vid, temp));
-				}
+                    for (int que_i = que_t0; que_i < que_t1; ++que_i) {
+                        int v = que[que_i];
 
-				int nowBndID = v2p_Global[v1];
-				if (nowBndID == -1) continue;
+                        for (int i = 0; i < con[v].size(); ++i) {
+                            int tv = con[v][i];
+                            int td = d + 1;
 
+                            if (d == tmp_d[tv]) {
+                                if (v < tv) {
+                                    tmp_s[v].second |= tmp_s[tv].first;
+                                    tmp_s[tv].second |= tmp_s[v].first;
+                                }
+                            } else if( d < tmp_d[tv]) {
+                                if (tmp_d[tv] == MAXD) {
+                                    que[que_h++] = tv;
+                                    tmp_d[tv] = td;
+                                }
+                                child_es[num_child_es].first  = v;
+                                child_es[num_child_es].second = tv;
+                                ++num_child_es;
+                          }
+                        }
+                    }
 
-				for (int ii=0; ii<conB[nowBndID].size(); ++ii){
-					int vid = conB[nowBndID][ii] >> MAXMOV1,
-						ovid = p2v_Global[vid];
+                    for (int i = 0; i < num_child_es; ++i) {
+                        int v = child_es[i].first, c = child_es[i].second;
+                        tmp_s[c].first  |= tmp_s[v].first;
+                        tmp_s[c].second |= tmp_s[v].second;
+                    }
 
-					Messages[v2part[ovid]].push_back(make_pair(ovid, temp));
-				}
-			}
+                    que_t0 = que_t1;
+                    que_t1 = que_h;
+                }
 
-			// == 先完成一波整合，基于 | 运算 ==
-			for (int i=0; i<_num_workers; ++i)
-				if (Messages[i].size() > 1)
-					merge(Messages[i]);
-
-			all_to_all(Messages);
-			worker_barrier();
-
-			CandV.clear();	
-			swap(LocalInf, CandV);
-
-			for (int i=0; i<_num_workers; ++i){
-				CandV.insert(CandV.end(), Messages[i].begin(), Messages[i].end());
-				vector<pair<unsigned, unsigned> >().swap(Messages[i]);
-			}
-
-			if (CandV.size() > 1) 
-				merge(CandV);
-			
-			long long cnt = all_sum_LL(CandV.size());
-			worker_barrier();
-
-			if (cnt == 0)
-				break;
-
-			if (_my_rank == 0)
-				cout<<dis <<"  Cnt: "<<cnt<<endl;
-
-			vector<vector<pair<unsigned, unsigned> > >().swap(Messages);
-			Messages.resize(_num_workers);
-
-			dis += 1;
-		}
+                for (int v = 0; v < totalV; ++v) {
+                    label_bp[v].bpspt_d[i_bpspt] = tmp_d[v];
+                    label_bp[v].bpspt_s[i_bpspt][0] = tmp_s[v].first;
+                    label_bp[v].bpspt_s[i_bpspt][1] = tmp_s[v].second & ~tmp_s[v].first;
+                }
+            }		
+        }
     }
 
 
-    int prune_by_root(int u, int v, int d) {
-		// 依托 root 的labels 进行剪枝
-		int mind = 1000000;
-		for (int i=0; i<topk; ++i){
-			int dd = root[u][i]+root[v][i];
-			if (mind > dd)
-				mind = dd;
-		}
-
-		if (d >= mind) 
-			return 0;
-		else
-			return 1;
+    bool prune_by_bp(int u, int v, int d) {
+        BPLabel &idx_u = label_bp[u], &idx_v = label_bp[v];
+        for (int i = 0; i < N_ROOTS; ++i) {
+            int td = idx_u.bpspt_d[i] + idx_v.bpspt_d[i];
+            if (td - 2 <= d)
+                td += (idx_u.bpspt_s[i][0] & idx_v.bpspt_s[i][0]) ? -2 :
+                        ((idx_u.bpspt_s[i][0] & idx_v.bpspt_s[i][1]) | (idx_u.bpspt_s[i][1] & idx_v.bpspt_s[i][0])) ? -1 : 0;
+            if (td <= d) return true;
+        }
+        return false;
     }
 
 
 	virtual void blockInit(VertexContainer &, BlockContainer &blocks){
-		// sortList, sortTotal confirm	
-		for (int i=0; i<v2degree.size(); ++i){
-			if (v2degree[i] > 100000000)
-				sortTotal.push_back(make_pair(v2degree[i], -i)); // pos就是id
+		MAXDIS = 2; MAXMOV = 1;
+		while( MAXINT / (totalV * 2) >= MAXDIS ) {
+			MAXDIS *= 2;
+			++MAXMOV;
+		}
+		MASK = MAXDIS - 1;
 
-			if (v2part[i] == _my_rank)
-				sortList.push_back(make_pair(v2degree[i], -i));
+        v2p.resize(totalV, -1);
+		p2v.resize(totalV, -1);
+
+        for (int pos=0; pos<vertexes.size(); ++pos){
+            LCRVertex * v = vertexes[pos];
+            
+			int vid = v->id, flg = v2degree[vid];
+			
+            if (v->value().Edge.size() > 0) 
+				BoundNum += 1;
+
+			sortList.push_back(make_pair(flg, -vid)); // pos就是id
 		}
 
-		// cout<<_my_rank<<"  "<<sortTotal.size()<<endl;
-
-		v2p.resize(totalV, -1);
-		p2v.resize(totalV, -1);
-		
-		sort(sortList.rbegin(), sortList.rend());
-		
+        sort(sortList.rbegin(), sortList.rend());
 		for (int i=0; i<sortList.size(); ++i){
 			v2p[-sortList[i].second] = i;
 			p2v[i] = -sortList[i].second; // new 2 old
 		}
 
-		v2p_Global.resize(totalV, -1); // id 不连续
-		p2v_Global.resize(totalV, -1);
-		
-		sort(sortTotal.rbegin(), sortTotal.rend());
-		
-		for (int i=0; i<sortTotal.size(); ++i){
-			v2p_Global[-sortTotal[i].second] = i;
-			p2v_Global[i] = -sortTotal[i].second; // new 2 old
-		}
-
-		// ======================================
         con.resize(sortList.size());
-		conB.resize(sortTotal.size());
-		root = new vector<unsigned>[sortList.size()]; // 收集到landmark的distance值
+		conB.resize(totalV);
 
-		MAXDIS1 = 2; MAXMOV1 = 1;
-		while( MAXINT / (BdV * 2) >= MAXDIS1 ) {
-			MAXDIS1 *= 2;
-			++MAXMOV1;
-		}
-		MASK1 = MAXDIS1 - 1;
-
-
-		for (int i=0; i<sortList.size(); ++i){
+        for (int i=0; i<sortList.size(); ++i){
             int ovid = p2v[i];
-			root[i].resize(topk, 100000);
+			// if (_my_rank == 1)
+			// 	cout<<"old:  "<<ovid<<"   new:  "<<i<<endl;
 
             vector<int>& local = vertexes[vert2place[ovid]]->value().Local;
-            
-			for( int p = 0; p < local.size(); ++p ) {
-                int j = v2p[local[p]];
+            for( int p = 0; p < local.size(); ++p ) {
+                int jj = local[p]; 
+                int j = v2p[jj];
 
-                con[j].push_back(i); // 内部存储的
+                con[j].push_back(i);
 		    }
 			
-			// ===================================
 			vector<int>& edge = vertexes[vert2place[ovid]]->value().Edge;
-			if (edge.size() > 0){
-				int newPos = v2p_Global[ovid]; // 在边界图上的定位
-				for( int p = 0; p < edge.size(); ++p ) {
-					int newVid = v2p_Global[edge[p]]; // 在边界图上的定位
+            for( int p = 0; p < edge.size(); ++p ) {
+                int jj = edge[p]; 
+				unsigned val = (jj << MAXMOV) | 1;
 
-					unsigned elem = newVid << MAXMOV1 | 1;
-
-					conB[newPos].push_back(elem); // 存的是原始id信息
-				}
-			}
-
+                conB[ovid].push_back(val); // 存的是原始id信息
+		    }
 
 			vertexes[vert2place[ovid]]->value().empty();
         }
 
 		vector<pair<int, int>>().swap(sortList);
 		vector<LCRVertex *>().swap(vertexes);
-
-
-		// // ======================================
-		for (int i=0; i<topk; ++i){
-			int vid = - sortTotal[i].second;
-			if (v2part[vid] == _my_rank){ 
-				unsigned tgt = pow(2,i); // vid 当前激活点，i 目标点
-				CandV.push_back(make_pair(vid, tgt));
-			}
-		}
-		vector<pair<int, int>>().swap(sortTotal);
 	}
 
 
@@ -376,13 +331,10 @@ public:
 		}
 		
         int flg = v->value().Edge.size()>0? 1:0;
-        int vals = flg*100000000 + v->value().Edge.size() + 
+        int vals = flg*10000000 + v->value().Edge.size() + 
                    v->value().Local.size();
 		
-		if (flg == 1) BoundNum += 1;
-
 		v2degree[va] = vals;
-		LocaEdges += v->value().Local.size();
 	}
 
 
@@ -396,15 +348,9 @@ public:
 
 
 	void Part2hop(){
-		actV = *max_element(ActiveV.begin(), ActiveV.end());
-		MAXDIS = 2; MAXMOV = 1;
-		while( MAXINT / (actV * 2) >= MAXDIS ) {
-			MAXDIS *= 2;
-			++MAXMOV;
-		}
-		MASK = MAXDIS - 1;
-
 		totalV = con.size();
+		bool consider_indep = false;
+        construct_bp_label();
 
 		omp_set_num_threads(threads);
 		double t = omp_get_wtime();
@@ -413,6 +359,7 @@ public:
 		for( int i = 0; i < totalV; ++i ) 
 			pos[i] = new int[MAXDIS];
 
+		
 		label = new vector<unsigned>[totalV]; // unsigned 整合了 id+dis
 		flags = new vector<unsigned>[totalV]; 
 
@@ -440,15 +387,16 @@ public:
 				long long local_cnt = 0;
 				unsigned char *used = new unsigned char[totalV/8+1];
 				memset( used, 0, sizeof(unsigned char) * (totalV/8+1) );
-				vector<int> cand, candFg, flags(BoundNum);
+				vector<int> cand, candFg, flgs(totalV);
 				
 				char *nowdis = new char[totalV];
 				memset( nowdis, -1, sizeof(char) * totalV);
 	
 				for( int u = pid; u < totalV; u += np ){
-
+					if (usd_bp[u]) continue;
 					cand.clear();
-					candFg.clear();					
+					candFg.clear();
+					
 					for( int i = 0; i < con[u].size(); ++i ){
 						int w = con[u][i];
 
@@ -458,10 +406,12 @@ public:
 
 							int ff = flags[w][j];
 
-							if (ff == 1 and flags[v] == 0){
-								flags[v] = 1;
+							if (w < BoundNum) ff = 1; // 由另外的边界点传输而来
+							
+							if (ff == 1 and flgs[v] == 0){
+								flgs[v] = 1;
 								candFg.push_back(v);
-							}
+							} 
 
 							if( !(used[v/8]&(1<<(v%8))) ) {
 								used[v/8] |= (1<<(v%8)), cand.push_back(v);
@@ -476,9 +426,7 @@ public:
 					
 					for( int i = 0; i < (int) cand.size(); ++i ) {
 						used[cand[i]/8] = 0;
-
-						int flg = prune_by_root(cand[i], u, dis);
-						if (flg == 1)
+						if( !prune_by_bp(u, cand[i], dis) )
 							if( can_update(cand[i], dis, nowdis) ) 
 								cand[n_cand++] = cand[i]; 
 					}
@@ -487,12 +435,12 @@ public:
 					sort(cand.begin(), cand.end());
 					for( int i = 0; i < (int) cand.size(); ++i ) {
 						label_new[u].push_back((((unsigned)cand[i])<<MAXMOV) | (unsigned) dis), ++local_cnt;
-						flg_new[u].push_back(flags[cand[i]]);
+						flg_new[u].push_back(flgs[cand[i]]);
 					}
 					for( int i = 0; i < (int) label[u].size(); ++i ) 
 						nowdis[label[u][i]>>MAXMOV] = -1;
 
-					for (int vid: candFg) flags[vid] = 0;
+					for (int vid: candFg) flgs[vid] = 0;
 				}
 				#pragma omp critical
 				{
@@ -518,18 +466,19 @@ public:
 				}
 			}
 			
-			if (_my_rank == tstid)
+			if (_my_rank == 0)
 			cout<<"Distance: "<<dis<<"   Cnt: "<<cnt<<endl;
-
 			delete[] label_new,flg_new;
 		}
 
 		delete[] pos;
 
 		for(int i=BoundNum; i<totalV; ++i){
-			Wavg += (label[i].size()+topk);
-			W1 += (label[i].size()+topk);
+			Wavg += label[i].size();
+			W1 += label[i].size();
 		}
+
+		
 
 	}
 
@@ -649,7 +598,6 @@ public:
 			delete[] label_new;
 		}
 
-		delete[] pos;
 		// vector<vector<unsigned> >().swap(con);
 		// for(int i = 0; i < totalV; ++i){
 		// 	label[i].push_back((((unsigned)i)<<MAXMOV) | 0);
@@ -657,12 +605,25 @@ public:
 	}
 
 
-	void BoundGraph(){
-
+	void LabelPrune(){ // == 有些标签删除之后，对于距离是不会有影响的，可并行 ==
+		long long total=0, cnt=0;
 		for (int i=0; i<BoundNum; ++i){
-			// obnd_id 是在边界图里面的 位置
-			int oid = p2v[i], 
-			    ob_id = v2p_Global[oid];
+			vector<unsigned>& lbs = flags[i];
+			// ==== revert search ===
+			for (int i=0; i<lbs.size(); ++i){
+				if (lbs[i] == 0) cnt += 1;
+			}
+			total += lbs.size();
+		}
+
+		long long T1 = all_sum_LL(total), T2 = all_sum_LL(cnt);
+		if (_my_rank == 0) cout<<"necessary:  "<<float(T2)/T1<<endl;
+	}
+
+
+	void BoundGraph(){
+		for (int i=0; i<BoundNum; ++i){
+			int oid = p2v[i];
 			
 			vector<unsigned>& lbs = label[i];
 			vector<unsigned>& fls = flags[i];
@@ -673,163 +634,140 @@ public:
 
 				unsigned vid = lbs[j] >> MAXMOV,
 						 dis = lbs[j] & MASK;
-
-				int ovid = p2v[vid], ob_vid = v2p_Global[ovid];
+				int ovid = p2v[vid];
 				
-				if (ob_id == ob_vid or dis == 0) continue;
+				if (oid == ovid or dis == 0) continue;
 
-				// ============= 
-				unsigned elem1 = ob_vid << MAXMOV1 | dis,
-					     elem2 =  ob_id << MAXMOV1 | dis;
+				// dis = 1;
+				unsigned elem1 = ovid << MAXMOV | dis,
+						 elem2 = oid << MAXMOV | dis;
+				// pair<int, int> elem1(ovid, dis), elem2(oid, dis);
 
-				
-				conB[ob_id].push_back(elem1);
-				conB[ob_vid].push_back(elem2);
+				conB[oid].push_back(elem1);
+				conB[ovid].push_back(elem2);
 			}
 
 			vector<unsigned>().swap(lbs);
 			vector<unsigned>().swap(fls);
-
-			// ====== 映射关系不对  =======
-			vector<unsigned>& rts = root[i];
-
-			for (int j=0; j<topk; ++j){
-				// j 实际是对应 boundary graph 的id
-				unsigned ob_vid = j, dis = rts[j];
-
-				if (ob_vid == ob_id or dis == 0) continue;
-
-				// if (oid == 5)
-				// 	cout<<p2v_Global[ob_vid]<<"  *  "<<dis<<endl;
-
-				unsigned elem1 = ob_vid << MAXMOV1 | dis,
-						 elem2 =  ob_id << MAXMOV1 | dis;
-
-				// if (_my_rank == 1)
-				// 	cout<<oid<<"  "<<ob_id<<"   -   "<<p2v_Global[ob_vid]<<"  "<<ob_vid<<endl;
-
-				conB[ob_id].push_back(elem1);
-				conB[ob_vid].push_back(elem2);
-			}
-
-			vector<unsigned>().swap(rts);
 		}
 
 		delete[] label;
 		delete[] flags;
 
-
-		vector<vector<vector<unsigned> > > CB(_num_workers);
+		long long edges = 0, TotalE = 0;
+		for (int i=0; i<conB.size(); ++i)
+			edges += conB[i].size();
 		
-		long long Edgess, aa = 0;
-		for (int i=0; i<conB.size(); ++i){
-			aa += conB[i].size();
+		TotalE = all_sum_LL(edges);
+		
+		if (_my_rank == 0){
+			cout<<"Bound V: "<<BdV<<"  E: "<<(long long)(TotalE/2)<<endl;
 		}
-		
-		Edgess = all_sum_LL(aa);
-		worker_barrier();
 
-		if (_my_rank == 0)
-		cout<<"V: "<<BdV<<"   E: "<<Edgess/2<<endl;
+
+		vector<vector<vector<unsigned > > > CB(_num_workers);
+		
 
 		// == 收集 CopyNum 顶点的标签信息  ==
 		int start = 0, batch = 10000;
-		if (start+batch > BdV)
-			batch = BdV-start;
+		if (start+batch > BoundNum)
+			batch = BoundNum-start;
 
 		while (1){
 			for (int i=start; i<start+batch; ++i){
-				
-				if (conB[i].size() == 0) continue;
-
-				conB[i].push_back(i); 
+				int vid = p2v[i];
+				conB[vid].push_back(vid);
 				for (int j=0; j<_num_workers; ++j)
-					if (j != _my_rank)
-						CB[j].push_back(conB[i]);
-				conB[i].pop_back();
+					CB[j].push_back(conB[vid]);
 			}
 			
 			all_to_all(CB);
 			worker_barrier();
 
 			for(int i=0; i<_num_workers; ++i){
-				
 				for (int j=0; j<CB[i].size(); ++j){
-					
 					vector<unsigned>& inf = CB[i][j];
 					int vid = inf[inf.size()-1];
 					inf.pop_back();
-
-					conB[vid].insert(conB[vid].end(), inf.begin(), inf.end());
-					
-					vector<unsigned>().swap(inf);
+					swap(conB[vid], inf);
+					vector<unsigned>(conB[vid]).swap(conB[vid]);
 				}
 			}
 			
 			for (int i=0; i<_num_workers; ++i)
-				vector<vector<unsigned> >().swap(CB[i]);
+				vector<vector<unsigned > >().swap(CB[i]);
 
-			vector<vector<vector<unsigned> > >(CB).swap(CB);
+			vector<vector<vector<unsigned > > >(CB).swap(CB);
 
 			start += batch;
 
 			int cntt = all_sum(start);
+			if (_my_rank == 0)
+				cout<<"Cnt: "<<cntt<<"  "<<BdV<<endl;
 
-			// if (_my_rank == 0)
-			// 	cout<<"Cnt: "<<cntt<<"  "<<BdV<<endl;
+			if (cntt == BdV) break;
 
-			if (cntt == _num_workers*BdV) break;
-
-			if (start+batch > BdV)
-				batch = BdV-start;
+			if (start+batch > BoundNum)
+				batch = BoundNum-start;
 		}
 
+		totalV = ALLVertices;
 
-		for (int i=0; i<conB.size(); ++i){
-			
-			if (conB[i].size() == 0) continue;
+		// == conB 格式转化 ==
+		v2p.resize(totalV, -1);
+		p2v.resize(totalV, -1);
+		vector<pair<int, int>>().swap(sortList);
 
-			vector<unsigned>& edges = conB[i];
-			sort(edges.begin(), edges.end());
-			int p = 1;
-			for( int j = 1; j < (int) edges.size(); ++j ){
-				unsigned id1 = edges[j-1] >> MAXMOV1,
-						 id2 = edges[j] >> MAXMOV1;
-				if( id1 != id2 ) 
-					edges[p++] = edges[j];
-			}
-			edges.resize(p);
+		for(int i=0; i<conB.size(); ++i){
+			if (conB[i].size() == 0) 
+				continue;
+			sortList.push_back(make_pair(v2degree[i], -i));
 		}
 
-		// ========= conB 格式转化 ===========
-		MAXMOV = MAXMOV1;
-		MASK = MASK1;
+		sort(sortList.rbegin(), sortList.rend());
+		for (int i=0; i<sortList.size(); ++i){
+			v2p[-sortList[i].second] = i;
+			p2v[i] = -sortList[i].second;
+		}
+		vector<vector<unsigned>>().swap(con);
+		con.resize(sortList.size());
 
-		vector<vector<unsigned> >().swap(con);
-		con.resize(BdV);
-
-		for (int i=0; i<conB.size(); ++i){
-			
-			vector<unsigned>& local = conB[i];
-			
+		for (int i=0; i<sortList.size(); ++i){
+			int ovid = p2v[i];
+			// cout<<"old:  "<<ovid<<"   new:  "<<i<<endl;
+			vector<unsigned>& local = conB[ovid];
 			for( int p = 0; p < local.size(); ++p ) {
+				unsigned jj = local[p] >> MAXMOV,
+						 dd = local[p] & MASK;
 
-				unsigned id = local[p] >> MAXMOV1, 
-						 dd = local[p] & MASK1;
+				unsigned j = v2p[jj], val = ((unsigned)i<<MAXMOV) | dd;
 				
-				unsigned elem = i << MAXMOV1 | dd;
-
-				con[id].push_back(elem);
+				// if (j >= con.size()) cout<<"error!"<<endl;
+				con[j].push_back(val);
 			}
 		}
-		
-		vector<vector<unsigned> >().swap(conB);
+		vector<vector<unsigned>>().swap(conB);
+		vector<pair<int, int>>().swap(sortList);
 	
 		for (int i=0; i<con.size(); ++i){
 			vector<unsigned>(con[i]).swap(con[i]);
 		}
 
+		// // string new_filename = "/home/hnu/Disk0/zyy_dataset/uk2002/graph.txt";
+		// // const char *file2 = new_filename.c_str();
+		// // fstream outfileX;
+		// // outfileX.open(file2, ios::out);
+		// // for (int i=0; i<con.size(); ++i){
+		// // 	for (int j=0; j<con[i].size(); ++j){
+		// // 		int id = con[i][j] >> MAXMOV;
+		// // 		outfileX<<to_String(i)<<" "<<to_String(id)<<endl;
+		// // 	}
+		// // }
+
+
+
 		worker_barrier();
+		// cout<<"End!! "<<con.size()<<endl;
 	}
 
 
@@ -865,6 +803,8 @@ public:
 			for(int j = 0; j < len; ++j){
 				unsigned vid = label[i][j]>>MAXMOV, dis = label[i][j]&MASK;
 				unsigned vv = unsigned(p2v[vid]);
+				// if (_my_rank == 0)
+				// cout<<vid<<"  "<<vv<<"  "<<dis<<endl;
 				unsigned val = vv << MAXMOV | dis;
 				s[j] = val;
 			}
@@ -913,7 +853,6 @@ public:
 		ifstream infile, infile1, infile2; // 先把分区文件读取
 		
 		threads = params.khop;
-		topk = 5;
 
 		const char *part_path = params.partition_path.c_str(); 
 		infile.open(part_path);
@@ -924,19 +863,14 @@ public:
 		}
 
 		int nnn = 0;
-		ActiveV.resize(_num_workers);
-
 		while(getline(infile, s)){
 			char* part = new char[strlen(s.c_str())+1];
 			strcpy(part, s.c_str());
-			int pt = atoi(part);
 			v2part.push_back( atoi(part) ); // 
-			ActiveV[pt] += 1;
 			v2degree.push_back(0); 
 			delete part;
 			nnn += 1;
 		}
-
 
 		const char *filepath = params.input_path.c_str(); //"data//Amazon_New.txt";
 
@@ -974,14 +908,12 @@ public:
 			}
 		}
 
-		BdV = all_sum(BoundNum);
 		totalV = all_sum(vertexes.size());
 		ALLVertices = all_sum(vertexes.size());
 		long long totalE = all_sum_LL(totalEdges);
 
-		// cout<<"rank: "<<_my_rank<<"  V: "<<vertexes.size()<<"   E: "<<LocaEdges<<endl;
-
 		blockInit(vertexes, blocks); 
+		BdV = all_sum(BoundNum);
 
 		if (_my_rank == 0){
 			cout<<"Total V: "<<totalV<<"  E: "<<totalE/2<<endl;
@@ -989,38 +921,27 @@ public:
 		}
 		
 		float t = omp_get_wtime();
-		
-		construct_bp_label();
-		
-		worker_barrier();
 
 		Part2hop();
 
-		// string new_filename = params.output_path + "In_"+ to_string(_my_rank);
+		// string new_filename = params.output_path + "In_"+ to_String(_my_rank);
 		// DHI_Store(new_filename);
 
-		for (int i=BoundNum; i<con.size(); ++i){
-			vector<unsigned>().swap(label[i]);
-			vector<unsigned>().swap(root[i]);
-		}
-
 		worker_barrier();
-		
-		float ttt1 = omp_get_wtime();
-		
-		BoundGraph();
 
-		float ttt2 = omp_get_wtime();
+		BoundGraph();
+		float ttt1 = omp_get_wtime()-t;
 
 		Core2hop();
 
-		// new_filename = params.output_path + "Bd_"+ to_string(_my_rank);
+		// new_filename = params.output_path + "Bd_"+ to_String(_my_rank);
 		// DHBound_Store(new_filename);
 		
 		float ttt = omp_get_wtime()-t;
 		if (_my_rank == 0){
 			cout<<"time: "<<ttt<<" s"<<endl;
-			cout<<"Inner time: "<<ttt1-t<<" s  "<<ttt2-ttt1<<"  s"<<endl;
+			cout<<"Inner time: "<<ttt1<<" s"<<endl;
+
 		}
 
 		#	pragma omp parallel
